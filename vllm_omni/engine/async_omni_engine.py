@@ -941,6 +941,7 @@ class AsyncOmniEngine:
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+            "llama_model_name": kwargs.get("llama_model_name", None),
             **(
                 {
                     "profiler_config": asdict(kwargs["profiler_config"])

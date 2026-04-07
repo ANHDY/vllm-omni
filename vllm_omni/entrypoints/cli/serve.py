@@ -404,6 +404,13 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable diffusion pipeline profiler to display stage durations.",
         )
+        # Image model parameters (e.g., HiDream)
+        omni_config_group.add_argument(
+            "--llama-model-name",
+            type=str,
+            default=None,
+            help="Specify the LLAMA model name or path.",
+        )
         return serve_parser
 
 
