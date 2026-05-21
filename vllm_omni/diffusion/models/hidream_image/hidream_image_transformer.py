@@ -29,6 +29,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = logging.get_logger(__name__)
 
@@ -62,7 +63,8 @@ class HiDreamImagePooledEmbed(nn.Module):
         self.pooled_embedder = TimestepEmbedding(in_channels=text_emb_dim, time_embed_dim=hidden_size)
 
     def forward(self, pooled_embed: torch.Tensor) -> torch.Tensor:
-        return self.pooled_embedder(pooled_embed)
+        #
+        return self.pooled_embedder(pooled_embed.to(dtype=torch.bfloat16))
 
 
 class HiDreamImageTimestepEmbed(nn.Module):
@@ -72,7 +74,7 @@ class HiDreamImageTimestepEmbed(nn.Module):
         self.timestep_embedder = TimestepEmbedding(in_channels=frequency_embedding_size, time_embed_dim=hidden_size)
 
     def forward(self, timesteps: torch.Tensor, wdtype: torch.dtype | None = None) -> torch.Tensor:
-        t_emb = self.time_proj(timesteps).to(dtype=wdtype)
+        t_emb = self.time_proj(timesteps).to(dtype=torch.bfloat16)
         t_emb = self.timestep_embedder(t_emb)
         return t_emb
 
@@ -104,7 +106,7 @@ class HiDreamImagePatchEmbed(nn.Module):
         self.proj = nn.Linear(in_channels * patch_size * patch_size, out_channels, bias=True)
 
     def forward(self, latent) -> torch.Tensor:
-        latent = self.proj(latent)
+        latent = self.proj(latent.to(dtype=torch.bfloat16))
         return latent
 
 
@@ -142,14 +144,6 @@ class HiDreamImageEmbedND(nn.Module):
             dim=-3,
         )
         return emb.unsqueeze(2)
-
-
-def apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
-    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
-    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
 
 class DistributedRMSNorm(nn.Module):
@@ -265,13 +259,14 @@ class HiDreamAttention(nn.Module):
             else:
                 self.q_rms_norm_t = nn.RMSNorm(self.tp_inner_dim, eps)
                 self.k_rms_norm_t = nn.RMSNorm(self.tp_inner_dim, eps)
+        self.rope = RotaryEmbedding(is_neox_style=False)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         hidden_states_masks: torch.Tensor | None = None,
         encoder_hidden_states: torch.Tensor | None = None,
-        image_rotary_emb: torch.Tensor = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         dtype = hidden_states.dtype
         batch_size = hidden_states.shape[0]
@@ -317,12 +312,17 @@ class HiDreamAttention(nn.Module):
             key = key_i
             value = value_i
 
-        if query.shape[-1] == image_rotary_emb.shape[-3] * 2:
-            query, key = apply_rope(query, key, image_rotary_emb)
+        cos, sin = image_rotary_emb
+        cos = cos.squeeze(2).to(query.dtype)
+        sin = sin.squeeze(2).to(query.dtype)
+        if query.shape[-1] == image_rotary_emb[0].shape[-1] * 2:
+            query = self.rope(query, cos, sin)
+            key = self.rope(key, cos, sin)
         else:
             query_1, query_2 = query.chunk(2, dim=-1)
             key_1, key_2 = key.chunk(2, dim=-1)
-            query_1, key_1 = apply_rope(query_1, key_1, image_rotary_emb)
+            key_1 = self.rope(query_1, cos, sin)
+            key_1 = self.rope(key_1, cos, sin)
             query = torch.cat([query_1, query_2], dim=-1)
             key = torch.cat([key_1, key_2], dim=-1)
 
@@ -532,7 +532,7 @@ class HiDreamImageSingleTransformerBlock(nn.Module):
         hidden_states_masks: torch.Tensor | None = None,
         encoder_hidden_states: torch.Tensor | None = None,
         temb: torch.Tensor | None = None,
-        image_rotary_emb: torch.Tensor = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         wtype = hidden_states.dtype
         shift_msa_i, scale_msa_i, gate_msa_i, shift_mlp_i, scale_mlp_i, gate_mlp_i = self.adaLN_modulation(temb)[
@@ -602,7 +602,7 @@ class HiDreamImageTransformerBlock(nn.Module):
         hidden_states_masks: torch.Tensor | None = None,
         encoder_hidden_states: torch.Tensor | None = None,
         temb: torch.Tensor | None = None,
-        image_rotary_emb: torch.Tensor = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         wtype = hidden_states.dtype
         (
@@ -660,7 +660,7 @@ class HiDreamBlock(nn.Module):
         hidden_states_masks: torch.Tensor | None = None,
         encoder_hidden_states: torch.Tensor | None = None,
         temb: torch.Tensor | None = None,
-        image_rotary_emb: torch.Tensor = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.block(
             hidden_states=hidden_states,
@@ -920,8 +920,12 @@ class HiDreamImageTransformer2DModel(nn.Module):
             device=img_ids.device,
             dtype=img_ids.dtype,
         )
-        ids = torch.cat((img_ids, txt_ids), dim=1)
-        image_rotary_emb = self.pe_embedder(ids)
+        image_rotary_emb = self.pe_embedder(img_ids)
+        text_rotary_emb = self.pe_embedder(txt_ids)
+        concat_rotary_emb = (
+            torch.cat([image_rotary_emb[..., 0, 0], text_rotary_emb[..., 0, 0]], dim=1),
+            torch.cat([image_rotary_emb[..., 1, 0], text_rotary_emb[..., 1, 0]], dim=1),
+        )
 
         # 2. Blocks
         block_id = 0
@@ -937,7 +941,7 @@ class HiDreamImageTransformer2DModel(nn.Module):
                 hidden_states_masks=hidden_states_masks,
                 encoder_hidden_states=cur_encoder_hidden_states,
                 temb=temb,
-                image_rotary_emb=image_rotary_emb,
+                image_rotary_emb=concat_rotary_emb,
             )
             initial_encoder_hidden_states = initial_encoder_hidden_states[:, :initial_encoder_hidden_states_seq_len]
             block_id += 1
@@ -962,7 +966,7 @@ class HiDreamImageTransformer2DModel(nn.Module):
                 hidden_states_masks=hidden_states_masks,
                 encoder_hidden_states=None,
                 temb=temb,
-                image_rotary_emb=image_rotary_emb,
+                image_rotary_emb=concat_rotary_emb,
             )
             hidden_states = hidden_states[:, :hidden_states_seq_len]
             block_id += 1
